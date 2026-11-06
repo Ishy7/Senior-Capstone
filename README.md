@@ -8,3 +8,7 @@ Repo for Senior Capstone Application
 
 ## Tools Used for Development
 [Android Studio](https://developer.android.com/studio)
+
+## Folder Structure
+[WearOS](WearOS/)
+Location for Android WearOS environment
