@@ -22,19 +22,19 @@ class BleConnection(
         fun onDisconnected()
         fun onServicesReady()
         fun onResponseReceived(data: ByteArray)
+        fun onCommandWriteComplete(success: Boolean, message: String?)
         fun onConnectionError(message: String)
     }
 
     private val appContext = context.applicationContext
 
     private var bluetoothGatt: BluetoothGatt? = null
-
-    private var responseCharacteristic:
-            BluetoothGattCharacteristic? = null
+    private var commandCharacteristic: BluetoothGattCharacteristic? = null
+    private var responseCharacteristic: BluetoothGattCharacteristic? = null
 
     private var isConnected = false
+    private var servicesReady = false
 
-    // Handles Bluetooth connection events
     private val gattCallback = object : BluetoothGattCallback() {
 
         override fun onConnectionStateChange(
@@ -47,16 +47,15 @@ class BleConnection(
                     "Bluetooth connection failed. Error: $status"
                 )
                 cleanup(gatt)
+                listener.onDisconnected()
                 return
             }
 
             when (newState) {
-
                 BluetoothProfile.STATE_CONNECTED -> {
                     isConnected = true
                     listener.onConnected()
 
-                    // Look for our custom BLE service
                     try {
                         gatt.discoverServices()
                     } catch (e: SecurityException) {
@@ -73,7 +72,6 @@ class BleConnection(
             }
         }
 
-        // Called when ESP32 services have been discovered
         override fun onServicesDiscovered(
             gatt: BluetoothGatt,
             status: Int
@@ -96,10 +94,20 @@ class BleConnection(
                 return
             }
 
-            // Find the response characteristic
+            commandCharacteristic = service.getCharacteristic(
+                COMMAND_CHARACTERISTIC_UUID
+            )
+
             responseCharacteristic = service.getCharacteristic(
                 RESPONSE_CHARACTERISTIC_UUID
             )
+
+            if (commandCharacteristic == null) {
+                listener.onConnectionError(
+                    "Command characteristic was not found."
+                )
+                return
+            }
 
             if (responseCharacteristic == null) {
                 listener.onConnectionError(
@@ -108,22 +116,21 @@ class BleConnection(
                 return
             }
 
-            // Subscribe to ESP32 notifications
             enableNotifications(gatt)
         }
 
-        // Receives notifications from the ESP32
+        // Receives notifications from the ESP32.
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
             if (characteristic.uuid == RESPONSE_CHARACTERISTIC_UUID) {
-                listener.onResponseReceived(value)
+                listener.onResponseReceived(value.copyOf())
             }
         }
 
-        // Support for older Android versions
+        // Support for older Android versions.
         @Suppress("DEPRECATION")
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
@@ -136,6 +143,23 @@ class BleConnection(
             }
         }
 
+        // Confirms whether a command write succeeded.
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            if (characteristic.uuid == COMMAND_CHARACTERISTIC_UUID) {
+                val success = status == BluetoothGatt.GATT_SUCCESS
+
+                listener.onCommandWriteComplete(
+                    success,
+                    if (success) null
+                    else "Command transmission failed. Error: $status"
+                )
+            }
+        }
+
         override fun onDescriptorWrite(
             gatt: BluetoothGatt,
             descriptor: BluetoothGattDescriptor,
@@ -143,6 +167,7 @@ class BleConnection(
         ) {
             if (descriptor.uuid == CLIENT_CONFIGURATION_UUID) {
                 if (status == BluetoothGatt.GATT_SUCCESS) {
+                    servicesReady = true
                     listener.onServicesReady()
                 } else {
                     listener.onConnectionError(
@@ -153,12 +178,11 @@ class BleConnection(
         }
     }
 
-    // Connect to the discovered ESP32
     @SuppressLint("MissingPermission")
     fun connect(device: BluetoothDevice) {
-
         if (bluetoothGatt != null) {
             disconnect()
+            close()
         }
 
         try {
@@ -175,10 +199,80 @@ class BleConnection(
         }
     }
 
-    // Enable notifications from the ESP32
+    // Sends one command to the ESP32.
+    @SuppressLint("MissingPermission")
+    fun sendCommand(data: ByteArray): Boolean {
+        val gatt = bluetoothGatt
+        val characteristic = commandCharacteristic
+
+        if (!isConnected || !servicesReady || gatt == null) {
+            listener.onConnectionError(
+                "Cannot send command: vest is not ready."
+            )
+            return false
+        }
+
+        if (characteristic == null) {
+            listener.onConnectionError(
+                "Command characteristic is unavailable."
+            )
+            return false
+        }
+
+        if (data.isEmpty()) {
+            listener.onConnectionError(
+                "Cannot send an empty command."
+            )
+            return false
+        }
+
+        return try {
+            characteristic.writeType =
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+
+            if (Build.VERSION.SDK_INT >= 33) {
+                val result = gatt.writeCharacteristic(
+                    characteristic,
+                    data,
+                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                )
+
+                if (result != BluetoothGatt.GATT_SUCCESS) {
+                    listener.onCommandWriteComplete(
+                        false,
+                        "Could not start command transmission. Error: $result"
+                    )
+                    false
+                } else {
+                    true
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                characteristic.value = data
+
+                @Suppress("DEPRECATION")
+                val result = gatt.writeCharacteristic(characteristic)
+
+                if (!result) {
+                    listener.onCommandWriteComplete(
+                        false,
+                        "Could not start command transmission."
+                    )
+                }
+
+                result
+            }
+        } catch (e: SecurityException) {
+            listener.onCommandWriteComplete(
+                false,
+                "Bluetooth permission missing."
+            )
+            false
+        }
+    }
+
     @SuppressLint("MissingPermission")
     private fun enableNotifications(gatt: BluetoothGatt) {
-
         val characteristic = responseCharacteristic ?: return
 
         try {
@@ -217,7 +311,6 @@ class BleConnection(
                         "Could not subscribe to notifications."
                     )
                 }
-
             } else {
                 @Suppress("DEPRECATION")
                 descriptor.value =
@@ -232,7 +325,6 @@ class BleConnection(
                     )
                 }
             }
-
         } catch (e: SecurityException) {
             listener.onConnectionError(
                 "Bluetooth permission missing."
@@ -240,7 +332,6 @@ class BleConnection(
         }
     }
 
-    // Disconnect from the ESP32
     @SuppressLint("MissingPermission")
     fun disconnect() {
         try {
@@ -253,7 +344,6 @@ class BleConnection(
         }
     }
 
-    // Release Bluetooth resources
     @SuppressLint("MissingPermission")
     fun close() {
         val gatt = bluetoothGatt ?: return
@@ -261,12 +351,14 @@ class BleConnection(
         try {
             gatt.close()
         } catch (_: SecurityException) {
-            // Bluetooth resources could not be closed
+            // Ignore cleanup errors.
         }
 
         bluetoothGatt = null
+        commandCharacteristic = null
         responseCharacteristic = null
         isConnected = false
+        servicesReady = false
     }
 
     private fun cleanup(gatt: BluetoothGatt) {
@@ -276,12 +368,16 @@ class BleConnection(
             try {
                 gatt.close()
             } catch (_: SecurityException) {
-                // Ignore cleanup errors
+                // Ignore cleanup errors.
             }
         }
     }
 
     companion object {
+        val COMMAND_CHARACTERISTIC_UUID: UUID =
+            UUID.fromString(
+                "12345678-1234-5678-1234-56789abcdef1"
+            )
 
         val RESPONSE_CHARACTERISTIC_UUID: UUID =
             UUID.fromString(
